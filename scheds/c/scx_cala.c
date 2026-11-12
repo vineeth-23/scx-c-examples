@@ -63,6 +63,20 @@ static int parse_options(int argc, char **argv)
 	return 0;
 }
 
+static void print_stats(const struct scx_cala *skel)
+{
+	printf("runnable=%llu runnable_events=%llu quiescent_events=%llu "
+	       "duplicate_runnable=%llu unmatched_quiescent=%llu "
+	       "task_storage_failures=%llu\n",
+	       (unsigned long long)skel->bss->nr_runnable,
+	       (unsigned long long)skel->bss->nr_runnable_events,
+	       (unsigned long long)skel->bss->nr_quiescent_events,
+	       (unsigned long long)skel->bss->nr_duplicate_runnable,
+	       (unsigned long long)skel->bss->nr_unmatched_quiescent,
+	       (unsigned long long)skel->bss->nr_task_storage_failures);
+	fflush(stdout);
+}
+
 int main(int argc, char **argv)
 {
 	struct scx_cala *skel;
@@ -84,8 +98,11 @@ restart:
 	link = SCX_OPS_ATTACH(skel, cala_ops, scx_cala);
 
 	printf("scx_cala is running. Press Ctrl-C to exit.\n");
-	while (!exit_req && !UEI_EXITED(skel, uei))
+	while (!exit_req && !UEI_EXITED(skel, uei)) {
+		print_stats(skel);
 		sleep(1);
+	}
+	print_stats(skel);
 
 	bpf_link__destroy(link);
 	ecode = UEI_REPORT(skel, uei);
