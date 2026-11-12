@@ -2,9 +2,9 @@
 /*
  * scx_cala: cache-affinity and load-aware sched_ext scheduler.
  *
- * This initial scaffold uses the kernel's default CPU selection helper and
- * the built-in global FIFO dispatch queue. Project-specific placement and
- * accounting policies are intentionally not implemented in this phase.
+ * This implementation currently uses the kernel's default CPU selection
+ * helper and the built-in global FIFO dispatch queue. Accounting observes
+ * placement but does not influence it yet.
  */
 #include <scx/common.bpf.h>
 
@@ -12,10 +12,13 @@ char _license[] SEC("license") = "GPL";
 
 UEI_DEFINE(uei);
 
+const volatile u32 nr_cpu_ids = 1;
+
 struct task_ctx {
 	bool runnable;
 	bool selection_pending;
 	s32 selected_cpu;
+	s32 assigned_cpu;
 };
 
 struct {
@@ -32,6 +35,13 @@ struct {
 	__uint(max_entries, 1);
 } actual_executions SEC(".maps");
 
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(key_size, sizeof(u32));
+	__uint(value_size, sizeof(s64));
+	__uint(max_entries, 1);
+} cpu_runnable SEC(".maps");
+
 u64 nr_runnable;
 u64 nr_runnable_events;
 u64 nr_quiescent_events;
@@ -44,6 +54,10 @@ u64 nr_duplicate_runnable;
 u64 nr_unmatched_quiescent;
 u64 nr_task_storage_failures;
 u64 nr_stats_map_failures;
+u64 nr_assignment_repairs;
+u64 nr_invalid_cpus;
+u64 nr_cpu_load_lookup_failures;
+u64 nr_cpu_load_underflows;
 
 static struct task_ctx *lookup_task_ctx(struct task_struct *p)
 {
@@ -56,6 +70,57 @@ static struct task_ctx *lookup_task_ctx(struct task_struct *p)
 	}
 
 	return tctx;
+}
+
+static s64 *lookup_cpu_load(s32 cpu)
+{
+	u32 key;
+	s64 *load;
+
+	if (cpu < 0 || (u32)cpu >= nr_cpu_ids) {
+		__sync_fetch_and_add(&nr_invalid_cpus, 1);
+		scx_bpf_error("invalid CPU %d for runnable accounting", cpu);
+		return NULL;
+	}
+
+	key = cpu;
+	load = bpf_map_lookup_elem(&cpu_runnable, &key);
+	if (!load) {
+		__sync_fetch_and_add(&nr_cpu_load_lookup_failures, 1);
+		scx_bpf_error("CPU %d runnable counter lookup failed", cpu);
+	}
+
+	return load;
+}
+
+static bool increment_cpu_load(s32 cpu)
+{
+	s64 *load = lookup_cpu_load(cpu);
+
+	if (!load)
+		return false;
+
+	__sync_fetch_and_add(load, 1);
+	return true;
+}
+
+static bool decrement_cpu_load(s32 cpu)
+{
+	s64 *load = lookup_cpu_load(cpu);
+	s64 old_load;
+
+	if (!load)
+		return false;
+
+	old_load = __sync_fetch_and_sub(load, 1);
+	if (old_load <= 0) {
+		__sync_fetch_and_add(load, 1);
+		__sync_fetch_and_add(&nr_cpu_load_underflows, 1);
+		scx_bpf_error("CPU %d runnable counter underflow", cpu);
+		return false;
+	}
+
+	return true;
 }
 
 s32 BPF_STRUCT_OPS(cala_select_cpu, struct task_struct *p, s32 prev_cpu,
@@ -93,6 +158,7 @@ s32 BPF_STRUCT_OPS(cala_init_task, struct task_struct *p,
 				    BPF_LOCAL_STORAGE_GET_F_CREATE);
 	if (tctx) {
 		tctx->selected_cpu = -1;
+		tctx->assigned_cpu = -1;
 		return 0;
 	}
 
@@ -122,6 +188,10 @@ void BPF_STRUCT_OPS(cala_runnable, struct task_struct *p, u64 enq_flags)
 		__sync_fetch_and_add(&nr_runnable_without_select, 1);
 	}
 
+	if (!increment_cpu_load(tctx->selected_cpu))
+		return;
+
+	tctx->assigned_cpu = tctx->selected_cpu;
 	tctx->runnable = true;
 	__sync_fetch_and_add(&nr_runnable, 1);
 }
@@ -143,15 +213,29 @@ void BPF_STRUCT_OPS(cala_running, struct task_struct *p)
 		__sync_fetch_and_add(&nr_stats_map_failures, 1);
 
 	tctx = lookup_task_ctx(p);
-	if (!tctx || !tctx->selection_pending)
+	if (!tctx)
 		return;
 
-	if (tctx->selected_cpu == actual_cpu)
-		__sync_fetch_and_add(&nr_selection_matches, 1);
-	else
-		__sync_fetch_and_add(&nr_selection_mismatches, 1);
+	if (tctx->selection_pending) {
+		if (tctx->selected_cpu == actual_cpu)
+			__sync_fetch_and_add(&nr_selection_matches, 1);
+		else
+			__sync_fetch_and_add(&nr_selection_mismatches, 1);
 
-	tctx->selection_pending = false;
+		tctx->selection_pending = false;
+	}
+
+	if (tctx->runnable && tctx->assigned_cpu != actual_cpu) {
+		if (!increment_cpu_load(actual_cpu))
+			return;
+		if (!decrement_cpu_load(tctx->assigned_cpu)) {
+			decrement_cpu_load(actual_cpu);
+			return;
+		}
+
+		tctx->assigned_cpu = actual_cpu;
+		__sync_fetch_and_add(&nr_assignment_repairs, 1);
+	}
 }
 
 void BPF_STRUCT_OPS(cala_quiescent, struct task_struct *p, u64 deq_flags)
@@ -173,8 +257,12 @@ void BPF_STRUCT_OPS(cala_quiescent, struct task_struct *p, u64 deq_flags)
 
 	if (tctx->selection_pending)
 		__sync_fetch_and_add(&nr_selection_not_observed, 1);
+	if (!decrement_cpu_load(tctx->assigned_cpu))
+		return;
+
 	tctx->selection_pending = false;
 	tctx->selected_cpu = -1;
+	tctx->assigned_cpu = -1;
 	tctx->runnable = false;
 	old_count = __sync_fetch_and_sub(&nr_runnable, 1);
 	if (!old_count) {
