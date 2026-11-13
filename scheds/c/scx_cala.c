@@ -18,7 +18,7 @@
 static const char help_fmt[] =
 "A cache-affinity and load-aware sched_ext scheduler.\n"
 "\n"
-"The load-only target is currently measured but not enforced.\n"
+"Load-only placement is enabled; additional modes are not implemented yet.\n"
 "\n"
 "Usage: %s [-vh]\n"
 "\n"
@@ -110,6 +110,7 @@ static void print_stats(const struct scx_cala *skel, int nr_cpus)
 	       "load_policy_not_observed=%llu "
 	       "load_policy_invalid_target=%llu "
 	       "load_policy_selection_map_failures=%llu "
+	       "load_policy_enforced=%llu "
 	       "load_sum=%lld load_snapshot_delta=%lld load_read_errors=%d",
 	       (unsigned long long)skel->bss->nr_runnable,
 	       (unsigned long long)skel->bss->nr_runnable_events,
@@ -137,6 +138,7 @@ static void print_stats(const struct scx_cala *skel, int nr_cpus)
 	       (unsigned long long)skel->bss->nr_load_policy_not_observed,
 	       (unsigned long long)skel->bss->nr_load_policy_invalid_target,
 	       (unsigned long long)skel->bss->nr_load_policy_selection_map_failures,
+	       (unsigned long long)skel->bss->nr_load_policy_enforced,
 	       (long long)load_sum,
 	       (long long)(load_sum - (__s64)skel->bss->nr_runnable),
 	       load_read_errors);

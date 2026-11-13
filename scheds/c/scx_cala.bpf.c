@@ -2,9 +2,8 @@
 /*
  * scx_cala: cache-affinity and load-aware sched_ext scheduler.
  *
- * This implementation currently uses the kernel's default CPU selection
- * helper and the built-in global FIFO dispatch queue. The load-only policy
- * target is computed for observation, but does not influence placement yet.
+ * This implementation places tasks on the least-loaded online CPU allowed
+ * by their affinity mask and uses built-in local FIFO dispatch queues.
  */
 #include <scx/common.bpf.h>
 
@@ -77,6 +76,7 @@ u64 nr_load_policy_differs_actual;
 u64 nr_load_policy_not_observed;
 u64 nr_load_policy_invalid_target;
 u64 nr_load_policy_selection_map_failures;
+u64 nr_load_policy_enforced;
 u32 load_tie_cursor;
 
 static struct task_ctx *lookup_task_ctx(struct task_struct *p)
@@ -213,10 +213,16 @@ s32 BPF_STRUCT_OPS(cala_select_cpu, struct task_struct *p, s32 prev_cpu,
 {
 	struct task_ctx *tctx;
 	bool is_idle = false;
-	s32 cpu, policy_cpu;
+	s32 cpu, default_cpu, policy_cpu;
 
-	cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
+	default_cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
 	policy_cpu = load_policy_target(p);
+	if (policy_cpu >= 0) {
+		cpu = policy_cpu;
+		__sync_fetch_and_add(&nr_load_policy_enforced, 1);
+	} else {
+		cpu = default_cpu;
+	}
 	tctx = lookup_task_ctx(p);
 	if (tctx) {
 		tctx->selected_cpu = cpu;
@@ -224,22 +230,23 @@ s32 BPF_STRUCT_OPS(cala_select_cpu, struct task_struct *p, s32 prev_cpu,
 		tctx->load_policy_cpu = policy_cpu;
 		tctx->load_policy_pending = policy_cpu >= 0;
 		if (policy_cpu >= 0) {
-			if (policy_cpu == cpu)
+			if (policy_cpu == default_cpu)
 				__sync_fetch_and_add(&nr_load_policy_matches_default, 1);
 			else
 				__sync_fetch_and_add(&nr_load_policy_differs_default, 1);
 		}
 	}
 
-	if (is_idle)
-		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0);
-
 	return cpu;
 }
 
 void BPF_STRUCT_OPS(cala_enqueue, struct task_struct *p, u64 enq_flags)
 {
-	scx_bpf_dsq_insert(p, SCX_DSQ_GLOBAL, SCX_SLICE_DFL, enq_flags);
+	/*
+	 * After select_cpu(), LOCAL refers to the selected CPU. For a slice
+	 * re-enqueue without select_cpu(), it keeps the task on its current CPU.
+	 */
+	scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, enq_flags);
 }
 
 s32 BPF_STRUCT_OPS(cala_init_task, struct task_struct *p,
