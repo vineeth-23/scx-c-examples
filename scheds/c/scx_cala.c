@@ -2,6 +2,7 @@
 /*
  * Userspace loader for scx_cala.
  */
+#include <getopt.h>
 #include <libgen.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -20,12 +21,19 @@ static const char help_fmt[] =
 "\n"
 "Load-only placement is enabled; additional modes are not implemented yet.\n"
 "\n"
-"Usage: %s [-vh]\n"
+"Usage: %s --mode load [-vh]\n"
 "\n"
-"  -v            Print libbpf debug messages\n"
-"  -h            Display this help and exit\n";
+"  -m, --mode MODE  Select placement mode (currently: load)\n"
+"  -v, --verbose    Print libbpf debug messages\n"
+"  -h, --help       Display this help and exit\n";
+
+enum policy_mode {
+	POLICY_MODE_UNSET,
+	POLICY_MODE_LOAD,
+};
 
 static bool verbose;
+static enum policy_mode policy_mode;
 static volatile sig_atomic_t exit_req;
 
 static int libbpf_print_fn(enum libbpf_print_level level, const char *format,
@@ -45,10 +53,28 @@ static void signal_handler(int signo)
 
 static int parse_options(int argc, char **argv)
 {
+	static const struct option long_options[] = {
+		{ "mode", required_argument, NULL, 'm' },
+		{ "verbose", no_argument, NULL, 'v' },
+		{ "help", no_argument, NULL, 'h' },
+		{},
+	};
 	int opt;
 
-	while ((opt = getopt(argc, argv, "vh")) != -1) {
+	while ((opt = getopt_long(argc, argv, "m:vh", long_options, NULL)) !=
+	       -1) {
 		switch (opt) {
+		case 'm':
+			if (policy_mode != POLICY_MODE_UNSET) {
+				fprintf(stderr, "Mode may be specified only once\n");
+				return -1;
+			}
+			if (strcmp(optarg, "load")) {
+				fprintf(stderr, "Unsupported mode: %s\n", optarg);
+				return -1;
+			}
+			policy_mode = POLICY_MODE_LOAD;
+			break;
 		case 'v':
 			verbose = true;
 			break;
@@ -59,6 +85,14 @@ static int parse_options(int argc, char **argv)
 			fprintf(stderr, help_fmt, basename(argv[0]));
 			return -1;
 		}
+	}
+	if (optind != argc) {
+		fprintf(stderr, "Unexpected positional argument: %s\n", argv[optind]);
+		return -1;
+	}
+	if (policy_mode == POLICY_MODE_UNSET) {
+		fprintf(stderr, "Missing required option: --mode load\n");
+		return -1;
 	}
 
 	return 0;
@@ -168,6 +202,9 @@ int main(int argc, char **argv)
 		fprintf(stderr, "Failed to determine the number of possible CPUs\n");
 		return 1;
 	}
+	printf("scx_cala configuration: mode=load slice=default possible_cpus=%d\n",
+	       nr_cpus);
+	fflush(stdout);
 
 	libbpf_set_print(libbpf_print_fn);
 	signal(SIGINT, signal_handler);
