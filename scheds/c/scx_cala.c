@@ -18,7 +18,7 @@
 static const char help_fmt[] =
 "A cache-affinity and load-aware sched_ext scheduler.\n"
 "\n"
-"Project-specific placement modes are not implemented yet.\n"
+"The load-only target is currently measured but not enforced.\n"
 "\n"
 "Usage: %s [-vh]\n"
 "\n"
@@ -67,18 +67,24 @@ static int parse_options(int argc, char **argv)
 static void print_stats(const struct scx_cala *skel, int nr_cpus)
 {
 	__u64 executions[nr_cpus];
+	__u64 policy_selections[nr_cpus];
 	__s64 loads[nr_cpus];
 	__u32 zero = 0;
 	__s64 load_sum = 0;
 	int cpu, load_read_errors = 0;
 
 	memset(executions, 0, sizeof(executions));
+	memset(policy_selections, 0, sizeof(policy_selections));
 	if (bpf_map_lookup_elem(bpf_map__fd(skel->maps.actual_executions),
 				&zero, executions))
 		memset(executions, 0, sizeof(executions));
 	for (cpu = 0; cpu < nr_cpus; cpu++) {
 		__u32 key = cpu;
 
+		if (bpf_map_lookup_elem(
+			    bpf_map__fd(skel->maps.load_policy_selections),
+			    &key, &policy_selections[cpu]))
+			policy_selections[cpu] = 0;
 		if (bpf_map_lookup_elem(bpf_map__fd(skel->maps.cpu_runnable),
 					&key, &loads[cpu])) {
 			loads[cpu] = 0;
@@ -95,6 +101,15 @@ static void print_stats(const struct scx_cala *skel, int nr_cpus)
 	       "task_storage_failures=%llu stats_map_failures=%llu "
 	       "assignment_repairs=%llu invalid_cpus=%llu "
 	       "cpu_load_lookup_failures=%llu cpu_load_underflows=%llu "
+	       "load_policy_evaluations=%llu load_policy_ties=%llu "
+	       "load_policy_no_candidate=%llu "
+	       "load_policy_matches_default=%llu "
+	       "load_policy_differs_default=%llu "
+	       "load_policy_matches_actual=%llu "
+	       "load_policy_differs_actual=%llu "
+	       "load_policy_not_observed=%llu "
+	       "load_policy_invalid_target=%llu "
+	       "load_policy_selection_map_failures=%llu "
 	       "load_sum=%lld load_snapshot_delta=%lld load_read_errors=%d",
 	       (unsigned long long)skel->bss->nr_runnable,
 	       (unsigned long long)skel->bss->nr_runnable_events,
@@ -112,13 +127,25 @@ static void print_stats(const struct scx_cala *skel, int nr_cpus)
 	       (unsigned long long)skel->bss->nr_invalid_cpus,
 	       (unsigned long long)skel->bss->nr_cpu_load_lookup_failures,
 	       (unsigned long long)skel->bss->nr_cpu_load_underflows,
+	       (unsigned long long)skel->bss->nr_load_policy_evaluations,
+	       (unsigned long long)skel->bss->nr_load_policy_ties,
+	       (unsigned long long)skel->bss->nr_load_policy_no_candidate,
+	       (unsigned long long)skel->bss->nr_load_policy_matches_default,
+	       (unsigned long long)skel->bss->nr_load_policy_differs_default,
+	       (unsigned long long)skel->bss->nr_load_policy_matches_actual,
+	       (unsigned long long)skel->bss->nr_load_policy_differs_actual,
+	       (unsigned long long)skel->bss->nr_load_policy_not_observed,
+	       (unsigned long long)skel->bss->nr_load_policy_invalid_target,
+	       (unsigned long long)skel->bss->nr_load_policy_selection_map_failures,
 	       (long long)load_sum,
 	       (long long)(load_sum - (__s64)skel->bss->nr_runnable),
 	       load_read_errors);
 	for (cpu = 0; cpu < nr_cpus; cpu++)
-		printf(" cpu%d_load=%lld cpu%d_executions=%llu", cpu,
+		printf(" cpu%d_load=%lld cpu%d_executions=%llu "
+		       "cpu%d_policy_selections=%llu", cpu,
 		       (long long)loads[cpu], cpu,
-		       (unsigned long long)executions[cpu]);
+		       (unsigned long long)executions[cpu], cpu,
+		       (unsigned long long)policy_selections[cpu]);
 	putchar('\n');
 	fflush(stdout);
 }
@@ -150,6 +177,13 @@ restart:
 	ret = bpf_map__set_max_entries(skel->maps.cpu_runnable, nr_cpus);
 	if (ret) {
 		fprintf(stderr, "Failed to size CPU runnable map: %d\n", ret);
+		scx_cala__destroy(skel);
+		return 1;
+	}
+	ret = bpf_map__set_max_entries(skel->maps.load_policy_selections,
+				       nr_cpus);
+	if (ret) {
+		fprintf(stderr, "Failed to size policy selection map: %d\n", ret);
 		scx_cala__destroy(skel);
 		return 1;
 	}
